@@ -1,0 +1,57 @@
+# Ships container logs straight to Elasticsearch - no Logstash in this
+# "simple setup" (see README.md for why). The dissect processor below
+# parses the backend's log line format - see backend/src/main/resources/
+# application.yml `logging.pattern.console` in Enterprise-DevOps-Learning-
+# Platform - into structured fields (log.level, log.logger, message) so
+# Kibana dashboards can filter/aggregate by level instead of doing text
+# search. If that console pattern ever changes, update the tokenizer below
+# to match; ignore_failure means a mismatch just leaves the line unparsed
+# (still indexed, just without structured fields) rather than dropping it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: filebeat-config
+  namespace: logging
+  labels:
+    app: filebeat
+data:
+  filebeat.yml: |-
+    filebeat.inputs:
+      - type: container
+        paths:
+          - /var/log/containers/*.log
+        multiline.pattern: '^\d{4}-\d{2}-\d{2}'
+        multiline.negate: true
+        multiline.match: after
+        processors:
+          - add_kubernetes_metadata:
+              host: ${NODE_NAME}
+              matchers:
+                - logs_path:
+                    logs_path: "/var/log/containers/"
+          - dissect:
+              tokenizer: "%{app.timestamp} [%{app.thread}] %{log.level->} %{log.logger} - %{message}"
+              field: "message"
+              target_prefix: ""
+              ignore_failure: true
+
+    processors:
+      - drop_event:
+          when:
+            contains:
+              kubernetes.namespace: "logging"
+
+    output.elasticsearch:
+      hosts: ["${ELASTICSEARCH_HOST:elasticsearch}:${ELASTICSEARCH_PORT:9200}"]
+
+    setup.kibana:
+      host: "${KIBANA_HOST:kibana}:${KIBANA_PORT:5601}"
+
+    setup.template.settings:
+      index.number_of_shards: 1
+      index.number_of_replicas: 0
+
+    setup.ilm.enabled: false
+
+    logging.level: info
+    logging.to_stderr: true
