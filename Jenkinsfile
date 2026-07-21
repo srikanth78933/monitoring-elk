@@ -1,8 +1,10 @@
 // monitoring-elk — deploys a lightweight ELK stack (Elasticsearch, Kibana,
-// Filebeat DaemonSet) into the same EKS cluster used by
-// Enterprise-DevOps-Learning-Platform, to collect and visualize backend
-// app logs. Filebeat ships straight to Elasticsearch - no Logstash - see
-// README.md for why.
+// Filebeat + Metricbeat DaemonSets) into the same EKS cluster used by
+// Enterprise-DevOps-Learning-Platform, to collect and visualize app logs
+// and node/pod resource metrics. Filebeat/Metricbeat ship straight to
+// Elasticsearch - no Logstash - see README.md for why. Dashboards are
+// imported automatically from kibana/saved-objects/dashboards.ndjson as
+// part of the deploy - see README.md's "Dashboards are code" section.
 //
 // Reuses the same Jenkins AWS credentials as that project's pipeline
 // (same cluster, same account).
