@@ -3,6 +3,15 @@
 # multi-node HA. It's reachable only inside the cluster (ClusterIP), so it's
 # fine for a learning/dev environment - do not expose this Service outside
 # the cluster without adding auth first.
+#
+# Heap/requests sized for a 2-node t3.small-class cluster (~1.42Gi
+# allocatable per node) - confirmed live via `kubectl describe node`. The
+# "normal" ES defaults (1g heap, 1.5Gi request) don't fit: that request
+# alone exceeds a single node's total allocatable memory, so the pod sits
+# Pending forever and cluster-autoscaler can't help (a same-type new node
+# hits the identical ceiling). 512m heap leaves only a thin margin overall
+# - fine for learning-platform log volume, but retune upward (and bump
+# ES_JAVA_OPTS/limits together) if you resize the node group later.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -21,6 +30,13 @@ spec:
       labels:
         app: elasticsearch
     spec:
+      # A freshly provisioned EBS volume mounts owned by root, but the ES
+      # container runs as uid 1000 - without this it can't write its own
+      # node.lock file and crash-loops on "failed to obtain node locks"
+      # (AccessDeniedException). fsGroup makes the volume group-writable
+      # by the container's user at mount time.
+      securityContext:
+        fsGroup: 1000
       # ES touches vm.max_map_count at startup; EKS's default AMI value
       # (65530) is already high enough, but this initContainer makes the
       # manifest self-sufficient on a node group where it isn't.
@@ -41,7 +57,7 @@ spec:
             - name: xpack.security.http.ssl.enabled
               value: "false"
             - name: ES_JAVA_OPTS
-              value: "-Xms1g -Xmx1g"
+              value: "-Xms512m -Xmx512m"
           ports:
             - containerPort: 9200
               name: http
@@ -50,10 +66,10 @@ spec:
           resources:
             requests:
               cpu: 250m
-              memory: 1.5Gi
+              memory: 700Mi
             limits:
               cpu: 1000m
-              memory: 2Gi
+              memory: 1Gi
           readinessProbe:
             httpGet:
               path: /_cluster/health?local=true

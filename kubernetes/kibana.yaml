@@ -23,10 +23,16 @@ spec:
               value: http://elasticsearch:9200
           ports:
             - containerPort: 5601
+          # Confirmed live: a 600Mi limit OOM-kills Kibana's Node.js process
+          # during startup ("FATAL ERROR: Reached heap limit... JavaScript
+          # heap out of memory") even with default plugins - 1Gi is the
+          # real floor for 8.11.3, not a guess. See elasticsearch.yaml for
+          # the same node-capacity story; cluster-autoscaler already added
+          # a 3rd node to fit this.
           resources:
             requests:
-              cpu: 250m
-              memory: 512Mi
+              cpu: 200m
+              memory: 700Mi
             limits:
               cpu: 500m
               memory: 1Gi
