@@ -1,47 +1,65 @@
 # monitoring-elk
 
-Centralized log collection for the backend deployed by
-[Enterprise-DevOps-Learning-Platform](https://github.com/srikanth78933/Enterprise-DevOps-Learning-Platform)
-(`enterprise-devops` namespace, `mycompany-dev-eks` cluster). Filebeat runs
-as a DaemonSet on every node, tails every container's logs, and ships them
-to Elasticsearch. Kibana sits on top for search and dashboards.
+Centralized log and metric collection for apps running on
+`mycompany-dev-eks` (currently `simple-java-app` in the `default`
+namespace; originally built against
+[Enterprise-DevOps-Learning-Platform](https://github.com/srikanth78933/Enterprise-DevOps-Learning-Platform)'s
+`enterprise-devops` backend, which isn't deployed on this cluster right
+now). Filebeat and Metricbeat both run as DaemonSets on every node -
+Filebeat tails every container's logs, Metricbeat pulls CPU/memory from
+each node's kubelet - and ship to a single Elasticsearch, with Kibana on
+top for search and dashboards.
 
 ## Why no Logstash
 
-This is Filebeat -> Elasticsearch -> Kibana, not the full ELK pipeline.
-Logstash adds a deployment to run and grok/filter pipelines to maintain,
-and buys nothing this setup needs: Filebeat's own processors already
-extract structured fields (see below), and there's no fan-in from multiple
-heterogeneous sources that would justify a routing layer. Add Logstash
-later if you need custom enrichment Filebeat processors can't express.
+This is Filebeat/Metricbeat -> Elasticsearch -> Kibana, not the full ELK
+pipeline. Logstash adds a deployment to run and grok/filter pipelines to
+maintain, and buys nothing this setup needs: Filebeat's own processors
+already extract structured fields (see below), and there's no fan-in from
+multiple heterogeneous sources that would justify a routing layer. Add
+Logstash later if you need custom enrichment Filebeat processors can't
+express.
 
 ## Architecture
 
 ```
                  ┌─────────────┐
  node 1  ──────▶ │  Filebeat   │─┐
+                 │  Metricbeat │─┤
  node 2  ──────▶ │  Filebeat   │─┼──▶ Elasticsearch (single-node) ──▶ Kibana
+                 │  Metricbeat │─┤
  node N  ──────▶ │  Filebeat   │─┘
+                 │  Metricbeat │
                  └─────────────┘
-   DaemonSet, one pod per node        StatefulSet, `logging` namespace
-   reads /var/log/containers/*.log
+   DaemonSets, one pod per node       StatefulSet, `logging` namespace
+   Filebeat:  /var/log/containers/*.log
+   Metricbeat: each node's kubelet (:10250/stats/summary) + /proc, /sys
 ```
 
-Everything lives in the `logging` namespace, separate from
-`enterprise-devops`. Elasticsearch and Kibana are ClusterIP-only (no
-Ingress, no auth) - reachable from inside the cluster and via
-port-forward, not from the internet. That's the deliberate "simple setup"
-tradeoff: no TLS/auth to stand up first, at the cost of Kibana only being
-reachable when you're port-forwarding.
+Everything lives in the `logging` namespace, separate from app
+namespaces. Elasticsearch and Kibana are ClusterIP-only (no Ingress, no
+auth) - reachable from inside the cluster and via port-forward, not from
+the internet. That's the deliberate "simple setup" tradeoff: no TLS/auth
+to stand up first, at the cost of Kibana only being reachable when you're
+port-forwarding.
 
-Filebeat's `dissect` processor parses the backend's console log format
-(`application.yml` -> `logging.pattern.console` in the app repo:
-`%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n`) into
-`log.level` / `log.logger` / `message` fields, so dashboards can filter and
-aggregate by log level instead of doing text search. If that pattern ever
-changes in the app repo, update the tokenizer in
-`kubernetes/filebeat-configmap.yaml` to match — a mismatch just leaves
-lines unparsed (still indexed under `message`), it doesn't drop them.
+Metricbeat's `kubernetes` module (metricsets: `node`, `pod`, `container`,
+`volume`) reads directly from each node's kubelet - no kube-state-metrics
+dependency, so no separate Deployment-mode component, just the DaemonSet.
+That means cluster-level object metrics (desired vs. available replicas,
+etc.) aren't collected, only resource usage. Add kube-state-metrics +
+the `state_*` metricsets later if you need that.
+
+Filebeat's `dissect` processor parses a Logback-style console log line
+(`%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n` - the
+`enterprise-devops` backend's format) into `log.level` / `log.logger` /
+`message` fields, so dashboards can filter and aggregate by log level
+instead of doing text search. Apps that don't log in this format (e.g.
+`simple-java-app`, which just does a bare `System.out.println`) still get
+indexed, just without those structured fields - `ignore_failure: true`
+means a mismatch never drops the line, only leaves it less parsed. Update
+the tokenizer in `kubernetes/filebeat-configmap.yaml` if the app's log
+format changes.
 
 ## Deploy
 
@@ -57,9 +75,13 @@ aws eks update-kubeconfig --name mycompany-dev-eks --region us-east-1
 ./scripts/verify-elk.sh
 ```
 
-`scripts/deploy-elk.sh` applies the namespace, Elasticsearch, Kibana, and
-Filebeat, waits for each rollout, then registers the `filebeat-*` Kibana
-data view automatically so logs are ready to browse the moment it exits.
+`scripts/deploy-elk.sh` applies the namespace, Elasticsearch, Kibana,
+Filebeat, and Metricbeat, waits for each rollout, then runs
+`scripts/import-dashboards.sh` to load `kibana/saved-objects/dashboards.ndjson`
+- both data views and both dashboards (see below) exist the moment it
+exits, no manual clicking required. Every step is a plain `kubectl apply`
+or an `overwrite=true` import, so rerunning this against a cluster that
+already has everything deployed is a safe no-op.
 
 ## Access Kibana
 
@@ -67,86 +89,95 @@ data view automatically so logs are ready to browse the moment it exits.
 ./scripts/kibana-port-forward.sh
 ```
 
-Then open http://localhost:5601. The `filebeat-*` data view already
-exists — go to **Discover**, pick it, and you should see log lines from
-every pod in the cluster, including `enterprise-devops` backend/MySQL
-pods. Filter to just the app with:
+Then open http://localhost:5601. Two dashboards are already built:
 
-```
-kubernetes.namespace : "enterprise-devops"
-```
+- **Backend App Logs** — http://localhost:5601/app/dashboards#/view/dashboard-backend-app-logs
+  Log volume over time by namespace, log volume by pod, and a raw
+  ERROR-level table (empty until an app with leveled logging, like
+  `enterprise-devops`, actually logs an error - `simple-java-app` never
+  will, see above).
+- **Infrastructure Metrics** — http://localhost:5601/app/dashboards#/view/dashboard-infra-metrics
+  Node CPU/memory usage over time, and top-10 pod CPU/memory usage over
+  time - sourced from Metricbeat.
 
-Other apps on the same cluster show up too, without any config change
-here — Filebeat runs per-node and isn't scoped to one namespace. E.g.
-`simple-java-app` (from the `simple-java-app` repo's Jenkins pipeline)
-deploys via `helm upgrade --install simple-java-app ...` with no
-`--namespace` flag, so it lands in `default`:
+Or go to **Discover** and pick the `App Logs (filebeat-*)` data view
+directly. Every pod on the cluster shows up (Filebeat isn't scoped to one
+namespace); filter to one app with e.g.:
 
 ```
 kubernetes.namespace : "default"
 ```
 
-Note: that app has no structured logging (see its `App.java` — one
-`System.out.println` at startup, nothing per-request, no levels), so its
-lines will show up in Discover but `log.level`/`log.logger` stay empty for
-them — the "log volume by level" / "errors table" dashboard panels built
-below only have data for apps that log like `enterprise-devops` does.
+(that's where `simple-java-app` lands - its Helm chart/Jenkins pipeline
+set no `--namespace`, so it falls back to `default`).
 
-## Building the dashboards
+## Dashboards are code, not clicks
 
-The data view is created automatically; the dashboards themselves are a
-few minutes of clicking in Kibana (Stack Management -> Saved Objects
-export/import wasn't worth the fragility here — Kibana's saved-object
-schema is version-specific and untested NDJSON is more likely to fail an
-import than save you the five minutes). In **Dashboard -> Create
-dashboard**, add these panels against the `filebeat-*` data view:
+`kibana/saved-objects/dashboards.ndjson` is a full export (via
+`POST /api/saved_objects/_export` with `includeReferencesDeep: true`) of
+both dashboards and everything they reference - data views,
+visualizations, the saved search. `scripts/import-dashboards.sh` re-imports
+it with `overwrite=true`, so it's rerun-safe and reproduces the exact same
+dashboards on a fresh cluster. If you change a dashboard by hand in the
+Kibana UI, re-export it the same way to keep this file in sync:
 
-1. **Log volume over time** — Lens, bar chart, X-axis `@timestamp`
-   (auto interval), break down by `log.level`. Immediate view of error
-   spikes.
-2. **Errors table** — Lens, table, filter `log.level : "ERROR"`, rows =
-   `message.keyword` (top values), metric = count. Shows which errors are
-   noisiest.
-3. **Log volume by pod** — Lens, bar or pie chart, break down by
-   `kubernetes.pod.name`, filtered to
-   `kubernetes.namespace : "enterprise-devops"`. Confirms both backend
-   replicas (and MySQL) are actually shipping logs, not just one.
+```bash
+kubectl run kb-export --rm -i --restart=Never -n logging \
+  --image=curlimages/curl:8.10.1 --command -- \
+  curl -s -X POST "http://kibana:5601/api/saved_objects/_export" \
+    -H "kbn-xsrf: true" -H "Content-Type: application/json" \
+    -d '{"objects":[{"type":"dashboard","id":"dashboard-backend-app-logs"},{"type":"dashboard","id":"dashboard-infra-metrics"}],"includeReferencesDeep":true}' \
+  > kibana/saved-objects/dashboards.ndjson
+```
 
-Save the dashboard as e.g. "Backend App Logs".
-
-## Infra/resource metrics (CPU, memory, JVM)
-
-Out of scope here on purpose — this repo is about logs. The app repo
-already reserves `/actuator/prometheus` for a Prometheus + Grafana stack
-(see `project-06-monitoring-prometheus-grafana` in that repo), which is
-the better fit for time-series resource/JVM metrics than bolting
-Metricbeat onto this Kibana. Say the word if you'd rather have metrics in
-Kibana too and I'll add a Metricbeat DaemonSet here instead.
+(strip any stray `pod "kb-export" deleted...` text `kubectl run --rm`
+appends to stdout before committing - check the last line parses as JSON.)
 
 ## Repo layout
 
 ```
 kubernetes/
-  namespace.yaml            → `logging` namespace
-  elasticsearch.yaml         → single-node ES, no auth, 10Gi gp2 PVC
-  kibana.yaml                → Kibana Deployment + ClusterIP Service
-  filebeat-rbac.yaml         → ServiceAccount + ClusterRole for k8s metadata enrichment
-  filebeat-configmap.yaml    → filebeat.yml (dissect parsing, ES output)
-  filebeat-daemonset.yaml    → one Filebeat pod per node
+  namespace.yaml              → `logging` namespace
+  elasticsearch.yaml          → single-node ES, no auth, 10Gi gp2 PVC, fsGroup 1000
+  kibana.yaml                  → Kibana Deployment + ClusterIP Service
+  filebeat-rbac.yaml           → ServiceAccount + ClusterRole for k8s metadata enrichment
+  filebeat-configmap.yaml      → filebeat.yml (dissect parsing, ES output)
+  filebeat-daemonset.yaml      → one Filebeat pod per node
+  metricbeat-rbac.yaml         → ServiceAccount + ClusterRole (nodes/stats, /metrics)
+  metricbeat-configmap.yaml    → metricbeat.yml (kubernetes + system modules)
+  metricbeat-daemonset.yaml    → one Metricbeat pod per node
+kibana/saved-objects/
+  dashboards.ndjson            → both dashboards + data views + visualizations, exported
 scripts/
-  deploy-elk.sh              → apply everything + wait for rollout
-  create-data-view.sh        → registers the `filebeat-*` Kibana data view
-  verify-elk.sh               → ES health + Filebeat rollout + doc counts
-  kibana-port-forward.sh     → localhost:5601 -> Kibana
-Jenkinsfile                  → CI entrypoint, calls the scripts above
+  deploy-elk.sh                → apply everything + wait for rollout + import dashboards
+  import-dashboards.sh         → (re)imports dashboards.ndjson, overwrite=true
+  verify-elk.sh                → ES health + DaemonSet rollout + log/metric doc counts
+  kibana-port-forward.sh       → localhost:5601 -> Kibana
+Jenkinsfile                    → CI entrypoint, calls the scripts above
 ```
 
-## Sizing note
+## Sizing note (validated live, not guessed)
 
-Elasticsearch requests 1.5Gi/250m and limits to 2Gi/1000m — tune
-`kubernetes/elasticsearch.yaml` to whatever your node group's instance
-type actually has headroom for; this wasn't validated against live node
-capacity.
+This was deployed and debugged against the real cluster - the numbers
+below are what actually worked, not defaults:
+
+- **Nodes are small**: 2-4x t3.small-class (~1.42Gi allocatable memory
+  each). Elasticsearch's "normal" defaults (1g heap, 1.5Gi request) don't
+  fit - that request alone exceeds one node's total capacity, so the pod
+  never schedules and cluster-autoscaler can't help (a same-type new node
+  hits the identical ceiling).
+- **Elasticsearch** (`kubernetes/elasticsearch.yaml`): 512m heap
+  (`-Xms512m -Xmx512m`), 700Mi/1Gi request/limit. Also needs
+  `securityContext.fsGroup: 1000` - without it, a freshly provisioned EBS
+  volume mounts owned by root while the ES container runs as uid 1000, so
+  it can't write its own `node.lock` and crash-loops.
+- **Kibana** (`kubernetes/kibana.yaml`): 700Mi/1Gi request/limit - a 600Mi
+  limit OOM-kills its Node.js process during startup even with default
+  plugins.
+- Deploying this stack made cluster-autoscaler grow the node group 2→4.
+  There's real but not huge headroom left (~500Mi+ free per node at last
+  check) - re-run `kubectl describe node <name> | grep -A5 "Allocated resources"`
+  before adding more to this namespace.
 
 ## Uninstall
 
@@ -154,5 +185,5 @@ capacity.
 kubectl delete namespace logging
 ```
 
-Deletes Elasticsearch, Kibana, Filebeat, and the ES PVC (data included) in
-one shot, and leaves `enterprise-devops` untouched.
+Deletes Elasticsearch, Kibana, Filebeat, Metricbeat, and the ES PVC (data
+included) in one shot, and leaves app namespaces untouched.

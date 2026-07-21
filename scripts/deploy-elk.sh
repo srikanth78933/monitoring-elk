@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploys Elasticsearch, Kibana, and the Filebeat DaemonSet into the
+# Deploys Elasticsearch, Kibana, Filebeat, and Metricbeat into the
 # `logging` namespace of the existing EKS cluster. Local equivalent of the
 # Jenkinsfile "Deploy ELK stack" stage - run this directly to test a change
 # before wiring it into Jenkins, or to redeploy manually.
@@ -28,11 +28,17 @@ kubectl apply -f "${ROOT_DIR}/kubernetes/filebeat-rbac.yaml"
 kubectl apply -f "${ROOT_DIR}/kubernetes/filebeat-configmap.yaml"
 kubectl apply -f "${ROOT_DIR}/kubernetes/filebeat-daemonset.yaml"
 
-echo "==> Waiting for Kibana and Filebeat to roll out"
+echo "==> Metricbeat (RBAC, config, DaemonSet)"
+kubectl apply -f "${ROOT_DIR}/kubernetes/metricbeat-rbac.yaml"
+kubectl apply -f "${ROOT_DIR}/kubernetes/metricbeat-configmap.yaml"
+kubectl apply -f "${ROOT_DIR}/kubernetes/metricbeat-daemonset.yaml"
+
+echo "==> Waiting for Kibana, Filebeat, and Metricbeat to roll out"
 kubectl rollout status deployment/kibana -n "${NAMESPACE}" --timeout=180s
 kubectl rollout status daemonset/filebeat -n "${NAMESPACE}" --timeout=180s
+kubectl rollout status daemonset/metricbeat -n "${NAMESPACE}" --timeout=180s
 
-echo "==> Registering the Kibana data view"
-"${ROOT_DIR}/scripts/create-data-view.sh"
+echo "==> Importing dashboards (data views, visualizations, saved search, dashboards)"
+"${ROOT_DIR}/scripts/import-dashboards.sh"
 
 echo "Deploy complete. Run scripts/kibana-port-forward.sh to open Kibana."

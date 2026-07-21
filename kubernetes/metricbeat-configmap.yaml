@@ -1,0 +1,61 @@
+# Node/pod/container resource metrics (CPU, memory, filesystem, network) -
+# no kube-state-metrics dependency, so no Deployment-mode metricsets
+# (state_pod, state_deployment, etc.) here, only what the `kubernetes`
+# module can pull directly from each node's kubelet, plus the `system`
+# module for host-level OS metrics. Keeps this a pure DaemonSet, matching
+# Filebeat's shape, and avoids installing another component.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: metricbeat-config
+  namespace: logging
+  labels:
+    app: metricbeat
+data:
+  metricbeat.yml: |-
+    metricbeat.modules:
+      - module: kubernetes
+        metricsets:
+          - node
+          - pod
+          - container
+          - volume
+        period: 30s
+        hosts: ["https://${NODE_NAME}:10250"]
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        ssl.verification_mode: "none"
+        add_metadata: true
+
+      - module: system
+        metricsets:
+          - cpu
+          - memory
+          - network
+          - filesystem
+          - process
+        period: 30s
+        processes: ['.*']
+        cpu.metrics: ["percentages"]
+        hostfs: /hostfs
+
+    processors:
+      - add_kubernetes_metadata:
+          host: ${NODE_NAME}
+          matchers:
+            - logs_path:
+                logs_path: "/var/log/containers/"
+
+    output.elasticsearch:
+      hosts: ["${ELASTICSEARCH_HOST:elasticsearch}:${ELASTICSEARCH_PORT:9200}"]
+
+    setup.kibana:
+      host: "${KIBANA_HOST:kibana}:${KIBANA_PORT:5601}"
+
+    setup.template.settings:
+      index.number_of_shards: 1
+      index.number_of_replicas: 0
+
+    setup.ilm.enabled: false
+
+    logging.level: info
+    logging.to_stderr: true
