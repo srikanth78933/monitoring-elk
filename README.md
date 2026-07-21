@@ -76,6 +76,22 @@ pods. Filter to just the app with:
 kubernetes.namespace : "enterprise-devops"
 ```
 
+Other apps on the same cluster show up too, without any config change
+here — Filebeat runs per-node and isn't scoped to one namespace. E.g.
+`simple-java-app` (from the `simple-java-app` repo's Jenkins pipeline)
+deploys via `helm upgrade --install simple-java-app ...` with no
+`--namespace` flag, so it lands in `default`:
+
+```
+kubernetes.namespace : "default"
+```
+
+Note: that app has no structured logging (see its `App.java` — one
+`System.out.println` at startup, nothing per-request, no levels), so its
+lines will show up in Discover but `log.level`/`log.logger` stay empty for
+them — the "log volume by level" / "errors table" dashboard panels built
+below only have data for apps that log like `enterprise-devops` does.
+
 ## Building the dashboards
 
 The data view is created automatically; the dashboards themselves are a
