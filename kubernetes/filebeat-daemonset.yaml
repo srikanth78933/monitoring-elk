@@ -48,7 +48,11 @@ spec:
           resources:
             requests:
               cpu: 100m
-              memory: 100Mi
+              # Real usage is ~41-46Mi (confirmed via `kubectl top`) - 100Mi
+              # was starving metricbeat of scheduling room on the node that
+              # also runs elasticsearch, where memory is already at ~95%
+              # requested. 64Mi still leaves ~40% headroom over observed use.
+              memory: 64Mi
             limits:
               cpu: 200m
               memory: 200Mi
